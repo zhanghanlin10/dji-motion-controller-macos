@@ -1,0 +1,18 @@
+# 构建产物
+*.app/
+client/DJIClient
+tools/hid_dump
+tools/hid_watch
+tools/hid_watch2
+tools/dji_hud
+tools/sdl_probe
+tools/sdl_map_test
+*.o
+*.dSYM/
+
+# macOS
+.DS_Store
+
+# 本地抓包日志
+*.log
+*.csv
