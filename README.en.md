@@ -115,7 +115,7 @@ or the two input paths will fight.
 Requires macOS 13+ and Xcode Command Line Tools (`xcode-select --install`).
 
 ```bash
-git clone https://github.com/<you>/dji-motion-controller-macos.git
+git clone https://github.com/zhanghanlin10/dji-motion-controller-macos.git
 cd dji-motion-controller-macos
 ./client/build.sh
 open "client/DJI 穿越摇杆 标定台.app"

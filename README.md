@@ -109,7 +109,7 @@ export SDL_GAMECONTROLLERCONFIG='0300703ba32c00002010000004040000,DJI C5,a:b0,b:
 要求：macOS 13+、Xcode Command Line Tools（`xcode-select --install`）。
 
 ```bash
-git clone https://github.com/<you>/dji-motion-controller-macos.git
+git clone https://github.com/zhanghanlin10/dji-motion-controller-macos.git
 cd dji-motion-controller-macos
 ./client/build.sh
 open "client/DJI 穿越摇杆 标定台.app"
