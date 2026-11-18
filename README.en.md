@@ -3,10 +3,10 @@
 Turn the **first-generation DJI FPV Motion Controller** (`VID 0x2CA3 / PID 0x1020`) into a usable
 flight-sim joystick on macOS.
 
-> DJI never shipped macOS driver or simulator support for this controller. But it *is* already a
-> standard HID Game Pad — what actually breaks is (1) simulators' game-controller layer rejects it,
-> and (2) its axes report **absolute hand attitude**, not a centred stick offset.
-> This project fixes both.
+> It is already a standard HID Game Pad. Three things actually get in the way: simulators'
+> game-controller layer rejects it, its axes carry **absolute attitude in the earth frame** rather
+> than stick offsets, and **heading is an absolute angle** rather than a yaw amount.
+> This project handles all three using only public macOS APIs — no driver, no security-policy changes.
 
 ![Calibration](docs/screenshots/calibration.png)
 
@@ -14,13 +14,13 @@ flight-sim joystick on macOS.
 
 ---
 
-## What the device really is
+## What the device reports
 
 The 1st-gen Motion Controller is a **motion controller**: no mechanical gimbal, attitude comes from an
-IMU. Its physical controls are the lock/brake button, throttle trigger, gear button, emergency stop,
-**gimbal tilt slider**, and record button.
+IMU. Physical controls: lock/brake, throttle trigger, gear, emergency stop, a **three-position gimbal
+switch**, and record.
 
-Plugged into macOS it enumerates as a composite device: **1 HID Game Pad + 2 CDC-ACM serial ports**.
+It enumerates as a composite device: **1 HID Game Pad + 2 CDC-ACM serial ports**.
 
 ### HID report — 13 bytes, ~196 Hz, no Report ID
 
@@ -33,24 +33,40 @@ Plugged into macOS it enumerates as a composite device: **1 HID Game Pad + 2 CDC
 | 9..10 | int16 LE | **Rx** |
 | 11..12 | int16 LE | **Ry** |
 
-### Axis map (verified by labelled gesture capture)
+### What the five axes actually mean
 
-| Axis | Physical motion | Measured span |
+| Axis | Meaning | Measured span |
 |---|---|---|
-| **X** | pitch — nod the wrist up/down | ±250–296 |
-| **Y** | roll — tilt the wrist left/right | 501 |
-| **Rx** | yaw — twist the wrist | 855 |
-| **Z** | throttle trigger | `-660 → +660` (one-directional, span 1313) |
-| **Ry** | gimbal tilt slider | spring-centred, rests at `0` |
+| **X / Y** | attitude components **in the earth frame** — not body pitch/roll | ±1024 |
+| **Rx** | **absolute heading** (−π..π, north = 0, wraps near south) | ±1024 |
+| **Z** | throttle trigger | `-660 .. +660` (= ±0.64 full scale) |
+| **Ry** | gimbal **three-position switch** (up / centre / down) | `−0.64 / 0 / +0.64` |
 
-### It reports absolute attitude
+Only **four** buttons ever appear in the bitmap (`#1–#4`).
 
-Measured over 96 seconds at rest it drifts by **one count** — rock stable. But the resting values are
-`X=-301 Y=-392 Rx=-729`: **they do not sit at zero.**
+### Why it can't be used as a stick directly
 
-The device reports *which way the body is pointing*, not *how far you pushed a stick*. Lying on a desk,
-it believes you are permanently banked. You must calibrate once **in your flying grip** and declare
-that pose as neutral — exactly what DJI's own app calls "calibration".
+**① X / Y are earth-frame.** Rotate your body and both change together. Body pitch/roll require a
+heading rotation first:
+
+```
+h     = Rx / 1024 · π
+Pitch = −( Y/1024 · cos h − X/1024 · sin h )
+Roll  = −( X/1024 · cos h + Y/1024 · sin h )
+```
+
+The transform is orthonormal (magnitude preserved). Enable it with the **手部坐标系** (body frame)
+toggle in the client.
+
+**② Rx is absolute heading, not a yaw amount.** Point north → 0, east ≈ +0.5, south ≈ ±1 then wraps.
+Wiring it straight to a rudder pins the control at full deflection. With **锁定 (Ry 触发)** enabled:
+
+- hold the gimbal switch up → heading deltas are tracked relative to that instant and used as yaw
+- release → yaw returns to zero and you can swing your arm freely
+
+**③ The resting values are not zero.** Measured over 96 seconds at rest it drifts by one count — very
+stable — but rests at `X=-301 Y=-392 Rx=-729`, because that *is* the current attitude. Calibrate once
+in your flying grip and declare that pose neutral.
 
 ---
 
@@ -58,32 +74,17 @@ that pose as neutral — exactly what DJI's own app calls "calibration".
 
 ### 1. Per-channel calibration + keyboard emulation (most reliable)
 
-Every simulator and game accepts keyboard input, so this path needs no HID recognition, no driver,
-and no entitlements beyond the Accessibility grant for synthetic key events.
+Every simulator accepts keyboard input — no HID recognition, no driver, no system entitlements beyond
+the Accessibility grant for synthetic key events.
 
-Per channel:
+Per channel: hold in your **flying grip** → **Recenter**; tilt to full deflection → **Set +max**;
+tilt the other way → **Set −max**. Ranges are stored **per side**, so an asymmetric feel is directly
+reproducible.
 
-1. Hold the controller in your **actual flying grip** → click **Recenter**
-2. Tilt to the angle you want as full deflection → **Set +max**
-3. Tilt the other way → **Set −max**
-
-Ranges are stored **per side**, so an asymmetric feel (15° forward / 25° back) is directly reproducible.
-
-Then map deflection to keys:
-
-| Channel | Push + | Pull − |
-|---|---|---|
-| Pitch | ↓ | ↑ |
-| Roll | → | ← |
-| Yaw | E | Q |
-| Throttle | = | - |
-
-The four physical buttons (`#1–#4`) can each be bound to a key in **hold** or **toggle** mode.
+Then map deflection to keys (Pitch ↓/↑, Roll →/←, Yaw E/Q, Throttle =/−). The four physical buttons
+can each be bound to a key in **hold** or **toggle** mode.
 
 ### 2. SDL mapping string (Liftoff / Velocidrone / DRL / Uncrashed)
-
-SDL's joystick layer sees the device, but its game-controller layer does not (`isGameController = 0`) —
-so these sims treat it as nothing at all. One mapping line fixes it:
 
 ```bash
 export SDL_GAMECONTROLLERCONFIG='0300703ba32c00002010000004040000,DJI C5,a:b0,b:b1,x:b2,y:b3,back:b4,start:b5,leftshoulder:b6,rightshoulder:b7,guide:b8,leftx:a0,lefty:a1,rightx:a3,righty:a4,lefttrigger:a2,platform:Mac OS X,'
@@ -92,27 +93,39 @@ export SDL_GAMECONTROLLERCONFIG='0300703ba32c00002010000004040000,DJI C5,a:b0,b:
 Or append the line from [`docs/gamecontrollerdb.txt`](docs/gamecontrollerdb.txt) to the sim bundle's
 `Contents/Resources/gamecontrollerdb.txt`.
 
-> Dropping `gamecontrollerdb.txt` into the working directory does **not** get auto-loaded.
+> A `gamecontrollerdb.txt` in the working directory is **not** auto-loaded.
 
 ### 3. X-Plane UDP (DREF)
 
-Enable "Drive X-Plane (UDP)" in the client; it pushes at 50 Hz:
+Enable "Drive X-Plane (UDP)"; it pushes at 50 Hz to `sim/joystick/yoke_*_ratio` and
+`sim/cockpit2/engine/actuators/throttle_ratio_all`. Don't also assign axes to `C5` inside X-Plane.
 
-| Channel | dataref |
-|---|---|
-| Pitch | `sim/joystick/yoke_pitch_ratio` |
-| Roll | `sim/joystick/yoke_roll_ratio` |
-| Yaw | `sim/joystick/yoke_heading_ratio` |
-| Throttle | `sim/cockpit2/engine/actuators/throttle_ratio_all` |
+---
 
-This bypasses the HID-recognition problem entirely. Don't also assign axes to `C5` inside X-Plane,
-or the two input paths will fight.
+## Prior art
+
+As far as this search reaches, **no native macOS implementation of this exact controller existed**:
+
+| Project | Platform | Approach | Handles heading? |
+|---|---|---|---|
+| [f2knpw/DJI_motionController_JoystickGremlin_Plugin](https://github.com/f2knpw/DJI_motionController_JoystickGremlin_Plugin) | Windows | JoystickGremlin + vJoy, Python | ✅ rotation + Ry latch |
+| [Hackaday #204697](https://hackaday.io/project/204697-hacking-dji-motion-controller-as-regular-joystick) | Android | B4A test app + research notes | ✅ rotation + Ry latch |
+| [Achilles10101/dji-rc-mac](https://github.com/Achilles10101/dji-rc-mac) | macOS | Raspberry Pi bridge → USB HID gamepad (DJI RC, not this controller) | — |
+| **This project** | **native macOS** | HID direct + calibration + keyboard + UDP | ✅ rotation + Ry latch |
+
+Cross-validation of measured values:
+
+| Item | Measured here | Independently reported |
+|---|---|---|
+| Button count | only `#1–#4` ever assert | "4 buttons, 5 axes" |
+| Trigger span | `−660..+660` (±0.645) | "Z capped at ±0.64" |
+| Gimbal axis at rest | constant `0` | three-position switch, centre |
 
 ---
 
 ## Quick start
 
-Requires macOS 13+ and Xcode Command Line Tools (`xcode-select --install`).
+Requires macOS 13+ and Xcode Command Line Tools.
 
 ```bash
 git clone https://github.com/zhanghanlin10/dji-motion-controller-macos.git
@@ -121,27 +134,19 @@ cd dji-motion-controller-macos
 open "client/DJI 穿越摇杆 标定台.app"
 ```
 
-For keyboard emulation, grant Accessibility:
+Grant Accessibility for keyboard emulation:
 **System Settings → Privacy & Security → Accessibility → enable `DJI 穿越摇杆 标定台`**
 
-> The app is ad-hoc signed locally, so **every rebuild** may require re-granting the permission.
-
-## Layout
-
-```
-client/   SwiftUI app (calibration + keyboard emulation + X-Plane UDP)
-tools/    C diagnostics used during reverse engineering
-docs/     full protocol write-up, SDL mapping, screenshots
-```
+> Ad-hoc signed locally, so **every rebuild** may require re-granting.
 
 ## Limitations
 
-- Only the **1st-gen** controller is verified. Later revisions may use different VID/PIDs —
-  check with `hidutil list | grep 0x2ca3`.
-- macOS user space cannot create a system-level virtual HID joystick (that needs Apple's
-  `com.apple.developer.hid.virtual.device` entitlement). Hence: SDL mapping, keyboard, UDP,
-  or a hardware bridge such as an RP2040.
-- Calibration is one-shot; changing grip requires re-centring.
+- Only the **1st-gen** controller is verified (`hidutil list | grep 0x2ca3` to check yours).
+- macOS user space cannot create a system-level virtual HID joystick without Apple's
+  `com.apple.developer.hid.virtual.device` entitlement, so the paths are keyboard, SDL mapping, or UDP.
+- A hardware bridge needs a **High-Speed USB host**: Pi Zero 2 W / Pi 4 / Pi 5. RP2040 and ESP32-S3
+  are Full-Speed only and cannot read this device — its interrupt endpoint uses 512-byte MPS, far above
+  the 64/128-byte Full-Speed limit.
 
 ## License
 

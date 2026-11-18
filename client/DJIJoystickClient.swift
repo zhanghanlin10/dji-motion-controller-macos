@@ -161,6 +161,8 @@ struct Profile: Codable {
     var channels: [Channel]
     var keyBindings: [KeyBinding]
     var axisBindings: [AxisKeyBinding]
+    var coordMode: Int? = nil      // 0 = 直通, 1 = 手部坐标系
+    var yawMode: Int? = nil        // 0 = 原始航向, 1 = 锁定式
 }
 
 func defaultChannels() -> [Channel] {
@@ -598,6 +600,11 @@ struct ContentView: View {
     @State private var keyBindings: [KeyBinding] = defaultKeyBindings()
     @State private var axisBindings: [AxisKeyBinding] = defaultAxisBindings()
     @State private var captureTarget: CaptureTarget?
+    @State private var coordMode = 0
+    @State private var yawMode = 0
+    @State private var virt: [Double] = [0, 0, 0, 0, 0]
+    @State private var yawRef: Double = 0
+    @State private var yawEngaged = false
     @State private var xplaneOn = false
     @State private var xplaneHost = "127.0.0.1"
     @State private var xplanePort = "49000"
@@ -634,30 +641,104 @@ struct ContentView: View {
             KeySender.shared.releaseAll()
         }
         .onChange(of: hid.raw) { _, _ in autoCenterOnce() }
+        .onChange(of: coordMode) { _, _ in resetCalibration([0, 1]); status = "坐标模式已切换，俯仰/横滚标定已重置" }
+        .onChange(of: yawMode) { _, _ in resetCalibration([3]); status = "偏航模式已切换，偏航标定已重置" }
+    }
+
+    var modeRow: some View {
+        HStack(spacing: 14) {
+            Text("坐标").font(.system(size: 11)).foregroundStyle(.secondary)
+            Picker("", selection: $coordMode) {
+                Text("直通 X/Y").tag(0)
+                Text("手部坐标系").tag(1)
+            }.pickerStyle(.segmented).labelsHidden().frame(width: 190)
+
+            Text("偏航").font(.system(size: 11)).foregroundStyle(.secondary)
+            Picker("", selection: $yawMode) {
+                Text("原始航向").tag(0)
+                Text("锁定 (Ry 触发)").tag(1)
+            }.pickerStyle(.segmented).labelsHidden().frame(width: 210)
+
+            if yawMode == 1 {
+                Text(yawEngaged ? "● 追踪中" : "○ 已锁定")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(yawEngaged ? Color.accentColor : Color.secondary)
+            }
+            Text(String(format: "航向 %.0f°", smooth(for: 3) / 1024.0 * 180.0))
+                .font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
+            if coordMode == 1 {
+                Text("X/Y 已按航向旋转")
+                    .font(.system(size: 10)).foregroundStyle(.orange)
+            }
+            Spacer()
+        }
     }
 
     var calibration: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            modeRow
         HStack(alignment: .top, spacing: 12) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 2) {
                     ForEach($channels) { $ch in
-                        ChannelRow(ch: $ch, rawValue: raw(for: ch.axis), capture: smooth(for: ch.axis)) {
-                            ch.center = smooth(for: ch.axis)
+                        ChannelRow(ch: $ch, rawValue: virtAt(ch.axis), capture: virtAt(ch.axis)) {
+                            ch.center = virtAt(ch.axis)
                         }
                         Divider().opacity(0.25)
                     }
                 }
             }
-            AttitudeScope(pitch: channels[0].normalize(smooth(for: 0)),
-                          roll: channels[1].normalize(smooth(for: 1)),
-                          yaw: channels[3].normalize(smooth(for: 3)),
-                          thr: channels[2].normalize(smooth(for: 2)))
+            AttitudeScope(pitch: channels[0].normalize(virtAt(0)),
+                          roll: channels[1].normalize(virtAt(1)),
+                          yaw: channels[3].normalize(virtAt(3)),
+                          thr: channels[2].normalize(virtAt(2)))
                 .frame(width: 180)
+        }
         }
     }
 
     func raw(for a: Int) -> Double { a < hid.raw.count ? hid.raw[a] : 0 }
     func smooth(for a: Int) -> Double { a < hid.ema.count ? hid.ema[a] : 0 }
+    func virtAt(_ a: Int) -> Double { a < virt.count ? virt[a] : 0 }
+
+    /// 把地球坐标系的 X/Y 转到手部坐标系，并把绝对航向变成可用的偏航增量
+    func updateVirtual() {
+        var v = [0, 1, 2, 3, 4].map { smooth(for: $0) }
+
+        // ① 坐标旋转：h = Rx·π，Pitch = -(Y·cosh - X·sinh)，Roll = -(X·cosh + Y·sinh)
+        if coordMode == 1 {
+            let h = v[3] / 1024.0 * Double.pi
+            let xn = v[0] / 1024.0, yn = v[1] / 1024.0
+            v[0] = -(yn * cos(h) - xn * sin(h)) * 1024.0
+            v[1] = -(xn * cos(h) + yn * sin(h)) * 1024.0
+        }
+
+        // ② 航向锁存：Ry 抬起 → 追踪相对航向；松开 → 偏航归零
+        if yawMode == 1 {
+            let ryRaw = smooth(for: 4)
+            let up = ryRaw > 300
+            if up && !yawEngaged { yawRef = v[3]; yawEngaged = true }
+            if !up && yawEngaged { yawEngaged = false }
+            if yawEngaged {
+                var d = v[3] - yawRef
+                while d > 1024 { d -= 2048 }
+                while d < -1024 { d += 2048 }
+                v[3] = d
+            } else {
+                v[3] = 0
+            }
+        }
+        virt = v
+    }
+
+    /// 切换模式后，受影响通道的标定值失效，重置为满量程
+    func resetCalibration(_ axes: [Int]) {
+        for i in channels.indices where axes.contains(channels[i].axis) {
+            channels[i].center = 0
+            channels[i].maxPos = 1024
+            channels[i].maxNeg = -1024
+        }
+    }
 
     var header: some View {
         HStack(spacing: 14) {
@@ -668,7 +749,8 @@ struct ContentView: View {
             Text("\(Int(hid.rate)) Hz").font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
             Spacer()
             Button("全部回中") {
-                for i in channels.indices { channels[i].center = smooth(for: channels[i].axis) }
+                updateVirtual()
+                for i in channels.indices { channels[i].center = virtAt(channels[i].axis) }
                 status = "所有通道已以当前姿态为中点"
             }
             .keyboardShortcut("r", modifiers: .command)
@@ -694,6 +776,9 @@ struct ContentView: View {
                     channels = defaultChannels()
                     keyBindings = defaultKeyBindings()
                     axisBindings = defaultAxisBindings()
+                    coordMode = 0
+                    yawMode = 0
+                    yawEngaged = false
                     didAutoCenter = true
                 }
             }
@@ -717,8 +802,9 @@ struct ContentView: View {
     func autoCenterOnce() {
         guard !didAutoCenter, hid.raw.contains(where: { $0 != 0 }) else { return }
         didAutoCenter = true
+        updateVirtual()
         for i in channels.indices {
-            let r = smooth(for: channels[i].axis)
+            let r = virtAt(channels[i].axis)
             channels[i].center = r
             channels[i].maxPos = r + 300
             channels[i].maxNeg = r - 300
@@ -728,11 +814,12 @@ struct ContentView: View {
 
     func startLoops() {
         tick = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { _ in
+            updateVirtual()
             processButtons()
             processAxes()
             if XPlaneLink.shared.enabled {
                 for ch in channels where ch.enabled && !ch.dataref.isEmpty {
-                    XPlaneLink.shared.send(ch.dataref, Float(ch.output(raw(for: ch.axis))))
+                    XPlaneLink.shared.send(ch.dataref, Float(ch.output(virtAt(ch.axis))))
                 }
             }
         }
@@ -766,7 +853,7 @@ struct ContentView: View {
     func processAxes() {
         for ab in axisBindings where ab.enabled && ab.keyCode >= 0 {
             guard ab.axis < channels.count else { continue }
-            let n = channels[ab.axis].normalize(smooth(for: ab.axis))
+            let n = channels[ab.axis].normalize(virtAt(ab.axis))
             let v = ab.dir == 0 ? n : -n
             let was = axisWas[ab.id] ?? false
             let on = was ? (v > ab.threshold - 0.06) : (v > ab.threshold)
@@ -808,7 +895,8 @@ struct ContentView: View {
     }
 
     func save() {
-        let p = Profile(channels: channels, keyBindings: keyBindings, axisBindings: axisBindings)
+        let p = Profile(channels: channels, keyBindings: keyBindings,
+                        axisBindings: axisBindings, coordMode: coordMode, yawMode: yawMode)
         do {
             try JSONEncoder().encode(p).write(to: storageURL)
             status = "已保存"
@@ -821,6 +909,8 @@ struct ContentView: View {
             channels = p.channels
             keyBindings = p.keyBindings.isEmpty ? defaultKeyBindings() : p.keyBindings
             axisBindings = p.axisBindings.isEmpty ? defaultAxisBindings() : p.axisBindings
+            coordMode = p.coordMode ?? 0
+            yawMode = p.yawMode ?? 0
             didAutoCenter = true
             status = "已载入配置"
         } else if let arr = try? JSONDecoder().decode([Channel].self, from: data), arr.count == 5 {
